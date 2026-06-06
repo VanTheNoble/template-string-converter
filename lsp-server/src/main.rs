@@ -32,23 +32,6 @@ fn write_message(writer: &mut impl Write, msg: &Value) {
     writer.flush().ok();
 }
 
-fn position_to_offset(text: &str, line: u32, character: u32) -> usize {
-    let mut cur_line = 0u32;
-    let mut cur_col = 0u32;
-    for (i, ch) in text.char_indices() {
-        if cur_line == line && cur_col == character {
-            return i;
-        }
-        if ch == '\n' {
-            cur_line += 1;
-            cur_col = 0;
-        } else {
-            cur_col += ch.len_utf16() as u32;
-        }
-    }
-    text.len()
-}
-
 fn offset_to_position(text: &str, target: usize) -> (u32, u32) {
     let mut line = 0u32;
     let mut col = 0u32;
@@ -177,14 +160,11 @@ fn main() {
                             "textDocumentSync": {
                                 "openClose": true,
                                 "change": 1
-                            },
-                            "documentOnTypeFormattingProvider": {
-                                "firstTriggerCharacter": "{"
                             }
                         },
                         "serverInfo": {
                             "name": "template-string-converter",
-                            "version": "0.0.1"
+                            "version": "0.0.2"
                         }
                     }
                 }));
@@ -227,19 +207,21 @@ fn main() {
                                 log!("  changed range: {}..{}", range_start, range_end);
 
                                 // Only scan the changed region for ${
-                                // Start 1 byte early to catch '$' that precedes the change
-                                let scan_start = if range_start > 0 { range_start - 1 } else { 0 };
-                                let changed_slice = &new_text[scan_start..range_end];
-                                let mut found: Vec<(usize, usize)> = Vec::new();
-                                let bytes = changed_slice.as_bytes();
-                                let mut i = 0;
-                                while i + 1 < bytes.len() {
+                                // Scan one byte early to catch a '$' that precedes the
+                                // change, and one byte late to catch a '{' that follows it
+                                // (e.g. typing '$' in front of an existing '{').
+                                let bytes = new_text.as_bytes();
+                                let scan_start = range_start.saturating_sub(1);
+                                let scan_end = (range_end + 1).min(bytes.len());
+                                // (open_quote, close_quote, dollar_pos)
+                                let mut found: Vec<(usize, usize, usize)> = Vec::new();
+                                let mut i = scan_start;
+                                while i + 1 < scan_end {
                                     if bytes[i] == b'$' && bytes[i + 1] == b'{' {
-                                        let abs_pos = scan_start + i;
-                                        if let Some((open, close)) = find_enclosing_quotes(&new_text, abs_pos) {
-                                            log!("  found ${{...}} at {} inside quotes {}..{}", abs_pos, open, close);
-                                            found.push((open, close));
-                                            i = close - scan_start + 1;
+                                        if let Some((open, close)) = find_enclosing_quotes(&new_text, i) {
+                                            log!("  found ${{...}} at {} inside quotes {}..{}", i, open, close);
+                                            found.push((open, close, i));
+                                            i = close + 1;
                                             continue;
                                         }
                                     }
@@ -253,7 +235,7 @@ fn main() {
                                     pre_edit_content.insert(uri.clone(), new_text.clone());
 
                                     let mut edits = Vec::new();
-                                    for (open, close) in &found {
+                                    for (open, close, dollar) in &found {
                                         let (ol, oc) = offset_to_position(&new_text, *open);
                                         let (cl, cc) = offset_to_position(&new_text, *close);
                                         edits.push(json!({
@@ -270,6 +252,24 @@ fn main() {
                                             },
                                             "newText": "`"
                                         }));
+
+                                        // Insert the closing '}' ourselves when it is not
+                                        // already there. Zed only auto-closes '{' when the
+                                        // following char is in `autoclose_before` (not word
+                                        // chars), so we can't rely on it. The '${' spans
+                                        // bytes [dollar, dollar+2); the slot right after is
+                                        // dollar+2.
+                                        let brace_slot = dollar + 2;
+                                        if bytes.get(brace_slot) != Some(&b'}') {
+                                            let (bl, bc) = offset_to_position(&new_text, brace_slot);
+                                            edits.push(json!({
+                                                "range": {
+                                                    "start": {"line": bl, "character": bc},
+                                                    "end":   {"line": bl, "character": bc}
+                                                },
+                                                "newText": "}"
+                                            }));
+                                        }
                                     }
 
                                     let req_id = next_request_id;
@@ -292,54 +292,6 @@ fn main() {
                         }
                     }
                 }
-            }
-
-            "textDocument/onTypeFormatting" => {
-                log!("onTypeFormatting request received");
-                let edits: Option<Value> = (|| {
-                    let uri = msg["params"]["textDocument"]["uri"].as_str()?;
-                    let line = msg["params"]["position"]["line"].as_u64()? as u32;
-                    let character = msg["params"]["position"]["character"].as_u64()? as u32;
-
-                    log!("  uri={}, position=({},{})", uri, line, character);
-
-                    let text = documents.get(uri)?;
-                    let offset = position_to_offset(text, line, character);
-                    let bytes = text.as_bytes();
-
-                    if offset < 2 || bytes[offset - 1] != b'{' || bytes[offset - 2] != b'$' {
-                        return None;
-                    }
-
-                    let (open, close) = find_enclosing_quotes(text, offset - 2)?;
-                    log!("  conversion: open={}, close={}", open, close);
-
-                    let (ol, oc) = offset_to_position(text, open);
-                    let (cl, cc) = offset_to_position(text, close);
-
-                    Some(json!([
-                        {
-                            "range": {
-                                "start": {"line": ol, "character": oc},
-                                "end":   {"line": ol, "character": oc + 1}
-                            },
-                            "newText": "`"
-                        },
-                        {
-                            "range": {
-                                "start": {"line": cl, "character": cc},
-                                "end":   {"line": cl, "character": cc + 1}
-                            },
-                            "newText": "`"
-                        }
-                    ]))
-                })();
-
-                write_message(&mut writer, &json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": edits
-                }));
             }
 
             "shutdown" => {
