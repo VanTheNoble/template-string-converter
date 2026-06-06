@@ -1,0 +1,17 @@
+id = "template-string-converter"
+name = "Template String Converter"
+version = "0.0.1"
+schema_version = 1
+authors = ["Ivan <ivan.sozza04@gmail.com>"]
+description = "Auto-converts quotes to backticks when typing ${ inside JS/TS strings"
+repository = "https://github.com/ivansozza/template-string-converter"
+
+[language_servers.template-string-converter]
+name = "Template String Converter"
+languages = ["JavaScript", "TypeScript", "TSX", "JSX"]
+
+[language_servers.template-string-converter.language_ids]
+"JavaScript" = "javascript"
+"TypeScript" = "typescript"
+"TSX" = "typescriptreact"
+"JSX" = "javascriptreact"
